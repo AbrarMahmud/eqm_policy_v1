@@ -1,0 +1,15 @@
+[project]
+name = "lerobot_policy_eqm"
+version = "0.1.0"
+description = "Equilibrium Matching Policy for Robot Imitation Learning in LeRobot"
+dependencies = [
+    "torch>=2.2",
+    "torchvision",
+    "huggingface_hub",
+    "gymnasium",
+]
+requires-python = ">=3.10"
+
+[build-system]
+requires = ["setuptools>=61.0.0"]
+build-backend = "setuptools.build_meta"
