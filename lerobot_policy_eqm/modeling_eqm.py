@@ -118,7 +118,34 @@ class EquilibriumModel(nn.Module):
 
         if config.compile_model:
             self.network = torch.compile(self.network, mode=config.compile_mode)
-
+    
+    
+    def forward_ebm(self, x_in: Tensor, lam_time: Tensor, global_cond=None, train=False) -> Tensor:
+        """
+        Transforms the UNet into a true Energy-Based Model (EBM).
+        Computes a scalar energy and returns its gradient w.r.t the input.
+        """
+        # Gradients must be enabled to compute autograd, even during inference
+        with torch.set_grad_enabled(True):
+            # Detach and require grad to track the derivative strictly for the input
+            x_in = x_in.detach().requires_grad_(True)
+            
+            # 1. Get raw representation from the network
+            x_out = self.network(x_in, lam_time, global_cond=global_cond)
+            
+            # 2. Construct L2 Energy: E = -0.5 * ||x_out||^2 (As per original EqM code)
+            E = -torch.sum(x_out**2, dim=(1, 2)) / 2.0
+            
+            # 3. The true output is the gradient of this Energy with respect to x_in
+            grad_out = torch.autograd.grad(
+                outputs=[E.sum()],
+                inputs=[x_in],
+                create_graph=train,  # Keep graph during training for backprop
+                only_inputs=True
+            )[0]
+            
+        return grad_out
+    
     def get_c_lambda(self, lam: Tensor) -> Tensor:
         """Configurable schedule for c(lamda) where c(1) = 0"""
         if self.config.eqm_schedule_type == "linear":
@@ -143,7 +170,6 @@ class EquilibriumModel(nn.Module):
         device = get_device_from_parameters(self)
         dtype = get_dtype_from_parameters(self)
 
-        # Initialize at standard normal
         sample = noise if noise is not None else torch.randn(
             size=(batch_size, self.config.horizon, self.config.action_feature.shape[0]),
             dtype=dtype,
@@ -154,12 +180,17 @@ class EquilibriumModel(nn.Module):
         lr = self.config.eqm_lr
         momentum = self.config.eqm_momentum
         velocity = torch.zeros_like(sample)
-        lam_zero = torch.zeros(sample.shape[:1], dtype=dtype, device=device) # Equilibrium is at lambda=0
 
         # Solvers
         for i in range(self.config.eqm_inference_steps):
-            # Evaluate gradient prediction at lambda=0
-            grad_pred = self.network(sample, lam_zero, global_cond=global_cond)
+            
+            # FIX: Anneal lambda from 1.0 to 0.0 to prevent OOD shock
+            current_lam = 1.0 - (i / self.config.eqm_inference_steps)
+            lam_tensor = torch.full(sample.shape[:1], current_lam, dtype=dtype, device=device)
+            lam_scaled = (lam_tensor * self.config.eqm_train_timesteps).long()
+            
+            # FIX: Use forward_ebm to get conservative gradients
+            grad_pred = self.forward_ebm(sample, lam_scaled, global_cond=global_cond, train=False)
             
             if self.config.eqm_sampler_type == "gd":
                 sample = sample - lr * grad_pred
@@ -169,26 +200,22 @@ class EquilibriumModel(nn.Module):
                 sample = sample - lr * velocity
                 
             elif self.config.eqm_sampler_type == "ode":
-                # Simple Euler ODE step. In practice, lambda steps from 1 to 0 over iterations.
-                current_lam = 1.0 - (i / self.config.eqm_inference_steps)
-                current_lam_tensor = torch.full(sample.shape[:1], current_lam, dtype=dtype, device=device)
-                flow = self.network(sample, current_lam_tensor, global_cond=global_cond)
                 step_size = 1.0 / self.config.eqm_inference_steps
-                sample = sample - step_size * flow
+                sample = sample - step_size * grad_pred
                 
             elif self.config.eqm_sampler_type == "adaptive":
                 sample = sample - lr * grad_pred
-                # FIX: Changed .view to .reshape here to prevent adaptive solver crashes
                 if torch.norm(grad_pred.reshape(batch_size, -1), dim=1).max() < self.config.ood_threshold:
                     break
 
         if self.config.clip_sample:
             sample = torch.clamp(sample, -self.config.clip_sample_range, self.config.clip_sample_range)
 
-        # OOD Evaluation: If gradients are still high at the end of the solve, we haven't found equilibrium
-        final_grad = self.network(sample, lam_zero, global_cond=global_cond)
+        # OOD Evaluation at equilibrium
+        lam_zero = torch.zeros(sample.shape[:1], dtype=dtype, device=device)
+        lam_scaled_zero = (lam_zero * self.config.eqm_train_timesteps).long()
+        final_grad = self.forward_ebm(sample, lam_scaled_zero, global_cond=global_cond, train=False)
         
-        # FIX: Changed .view to .reshape here to fix the runtime exception
         grad_norms = torch.norm(final_grad.reshape(batch_size, -1), dim=1)
         is_ood = grad_norms > self.config.ood_threshold
 
@@ -233,21 +260,16 @@ class EquilibriumModel(nn.Module):
         x_0 = batch[ACTION]
         eps = torch.randn_like(x_0)
         
-        # Sample lambda uniformly
         lam = torch.rand(x_0.shape[0], 1, 1, device=x_0.device)
-        
-        # Linear interpolation between noise and data
         x_lam = (1 - lam) * x_0 + lam * eps
         
-        # Equilibrium Matching Target: (eps - x_lambda) * c(lambda)
         c_lam = self.get_c_lambda(lam)
         target = (eps - x_lam) * c_lam
 
-        # For Unet embedding, convert lambda to pseudo-timestep via scaling
         lam_scaled = (lam.squeeze(-1).squeeze(-1) * self.config.eqm_train_timesteps).long()
         
-        # Network prediction for the gradient
-        pred_grad = self.network(x_lam, lam_scaled, global_cond=global_cond)
+        # FIX: Use the EBM forward pass instead of raw network
+        pred_grad = self.forward_ebm(x_lam, lam_scaled, global_cond=global_cond, train=True)
 
         loss = F.mse_loss(pred_grad, target, reduction="none")
 
