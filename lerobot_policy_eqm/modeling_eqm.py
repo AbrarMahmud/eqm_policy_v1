@@ -125,25 +125,28 @@ class EquilibriumModel(nn.Module):
         Transforms the UNet into a true Energy-Based Model (EBM).
         Computes a scalar energy and returns its gradient w.r.t the input.
         """
-        # CRITICAL FIX: Force PyTorch to exit inference_mode AND enable gradients locally
+        # 1. Temporarily escape inference mode and turn on autograd engine
         with torch.inference_mode(False), torch.enable_grad():
-            # Detach from any upstream frozen graphs and require grad to track the derivative
-            x_in = x_in.detach().requires_grad_(True)
             
-            # 1. Get raw representation from the network
+            # 2. FIX: Clone the inference tensor out of inference_mode to create 
+            # a regular tensor copy, then trigger gradient tracking.
+            x_in = x_in.clone().requires_grad_(True)
+            
+            # 3. Compute raw representation from the network
             x_out = self.network(x_in, lam_time, global_cond=global_cond)
             
-            # 2. Construct L2 Energy: E = -0.5 * ||x_out||^2
+            # 4. Construct L2 Energy: E = -0.5 * ||x_out||^2
             E = -torch.sum(x_out**2, dim=(1, 2)) / 2.0
             
-            # 3. The true output is the gradient of this Energy with respect to x_in
+            # 5. Compute the gradient of the energy with respect to x_in
             grad_out = torch.autograd.grad(
                 outputs=[E.sum()],
                 inputs=[x_in],
-                create_graph=train,  # Keep graph during training for backprop
+                create_graph=train,  # Only keeps graph if explicitly training
                 only_inputs=True
             )[0]
             
+        # 6. Detach before returning back to LeRobot's evaluation loop
         return grad_out.detach() # Detach the final output so it safely returns to the no_grad environment
     
     def get_c_lambda(self, lam: Tensor) -> Tensor:
