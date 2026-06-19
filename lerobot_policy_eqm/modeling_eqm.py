@@ -125,15 +125,15 @@ class EquilibriumModel(nn.Module):
         Transforms the UNet into a true Energy-Based Model (EBM).
         Computes a scalar energy and returns its gradient w.r.t the input.
         """
-        # Gradients must be enabled to compute autograd, even during inference
-        with torch.set_grad_enabled(True):
-            # Detach and require grad to track the derivative strictly for the input
+        # CRITICAL FIX: Force PyTorch to exit inference_mode AND enable gradients locally
+        with torch.inference_mode(False), torch.enable_grad():
+            # Detach from any upstream frozen graphs and require grad to track the derivative
             x_in = x_in.detach().requires_grad_(True)
             
             # 1. Get raw representation from the network
             x_out = self.network(x_in, lam_time, global_cond=global_cond)
             
-            # 2. Construct L2 Energy: E = -0.5 * ||x_out||^2 (As per original EqM code)
+            # 2. Construct L2 Energy: E = -0.5 * ||x_out||^2
             E = -torch.sum(x_out**2, dim=(1, 2)) / 2.0
             
             # 3. The true output is the gradient of this Energy with respect to x_in
@@ -144,7 +144,7 @@ class EquilibriumModel(nn.Module):
                 only_inputs=True
             )[0]
             
-        return grad_out
+        return grad_out.detach() # Detach the final output so it safely returns to the no_grad environment
     
     def get_c_lambda(self, lam: Tensor) -> Tensor:
         """Configurable schedule for c(lamda) where c(1) = 0"""
