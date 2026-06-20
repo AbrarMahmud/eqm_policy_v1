@@ -128,7 +128,7 @@ class EquilibriumModel(nn.Module):
         # 1. Temporarily escape inference mode and turn on autograd engine
         with torch.inference_mode(False), torch.enable_grad():
             
-            # 2. FIX: Clone the inference tensor out of inference_mode to create 
+            # 2. Clone the inference tensor out of inference_mode to create 
             # a regular tensor copy, then trigger gradient tracking.
             x_in = x_in.clone().requires_grad_(True)
             
@@ -146,9 +146,13 @@ class EquilibriumModel(nn.Module):
                 only_inputs=True
             )[0]
             
-        # 6. Detach before returning back to LeRobot's evaluation loop
-        return grad_out.detach() # Detach the final output so it safely returns to the no_grad environment
-    
+        # 6. FIX: Conditionally detach based on the train flag
+        if train:
+            return grad_out # Keep graph intact for accelerator.backward()
+        else:
+            return grad_out.detach() # Safely return to LeRobot's no_grad eval loop
+
+
     def get_c_lambda(self, lam: Tensor) -> Tensor:
         """Configurable schedule for c(lamda) where c(1) = 0"""
         if self.config.eqm_schedule_type == "linear":
