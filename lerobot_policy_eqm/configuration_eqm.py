@@ -50,8 +50,8 @@ class EqMConfig(PreTrainedConfig):
     # EqM Specific configurations
     eqm_schedule_type: str = "linear"  # Options: "linear", "softmax", "piecewise", "grad_multiplier"
     eqm_sampler_type: str = "gd"       # Options: "gd", "nag_gd", "ode", "adaptive"
-    eqm_train_timesteps: int = 100     # Granularity of lambda discretization for training
-    eqm_inference_steps: int = 100      # Number of steps for solvers
+    eqm_train_timesteps: int = 10     # Granularity of lambda discretization for training
+    eqm_inference_steps: int = 10      # Number of steps for solvers
     eqm_lr: float = 0.1                # Step size for GD / NAG-GD
     eqm_momentum: float = 0.9          # Momentum for NAG-GD
     ood_threshold: float = 0.05        # Threshold for gradient magnitude to flag OOD
