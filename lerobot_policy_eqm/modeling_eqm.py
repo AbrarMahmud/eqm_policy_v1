@@ -189,22 +189,43 @@ class EquilibriumModel(nn.Module):
         
         return grad
 
+    # def forward_score(
+    #     self,
+    #     x_in: Tensor,
+    #     global_cond: Tensor | None = None,
+    # ) -> Tensor:
+    #     """Evaluate the learned equilibrium gradient field at inference step."""
+    #     device = x_in.device
+    #     B = x_in.shape[0]
+    #     t_zero = torch.zeros(B, dtype=torch.long, device=device)
+
+    #     # Force gradient mapping generation during outer evaluation harness no_grad locks
+    #     with torch.enable_grad():
+    #         score = self.get_gradient_field(x_in, t_zero, global_cond=global_cond)
+
+    #     return score.detach()
     def forward_score(
         self,
         x_in: Tensor,
         global_cond: Tensor | None = None,
     ) -> Tensor:
         """Evaluate the learned equilibrium gradient field at inference step."""
-        device = x_in.device
-        B = x_in.shape[0]
-        t_zero = torch.zeros(B, dtype=torch.long, device=device)
+        # 1. Temporarily suspend the outer inference_mode and turn on autograd graph tracking
+        with torch.inference_mode(False), torch.enable_grad():
+            device = x_in.device
+            B = x_in.shape[0]
 
-        # Force gradient mapping generation during outer evaluation harness no_grad locks
-        with torch.enable_grad():
-            score = self.get_gradient_field(x_in, t_zero, global_cond=global_cond)
+            # 2. Convert incoming "Inference Tensors" to normal tensors by cloning them.
+            #    This creates a valid leaf node that the autograd engine can track.
+            x_in_normal = x_in.clone()
+            global_cond_normal = global_cond.clone() if global_cond is not None else None
+            t_zero = torch.zeros(B, dtype=torch.long, device=device)
 
-        return score.detach()
+            # 3. Compute the conservative gradient field vector
+            score = self.get_gradient_field(x_in_normal, t_zero, global_cond=global_cond_normal)
 
+            # 4. Detach the result so it safely returns back to LeRobot's inference stream
+            return score.detach()
     # ── Reverse process: noise → action ──────────────────────────────────────
 
     def conditional_sample(
