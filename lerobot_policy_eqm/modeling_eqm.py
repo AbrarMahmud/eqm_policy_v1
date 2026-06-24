@@ -2,33 +2,21 @@
 """
 Equilibrium Matching Policy for Robot Imitation Learning.
 
-Corrected to match the original EqM paper (arXiv 2510.02300) exactly.
+Corrected to match the original EqM paper (arXiv 2510.02300) exactly by
+enforcing a conservative gradient field derived from a scalar energy function.
 
-KEY DIVERGENCES FIXED vs. prior implementation
-───────────────────────────────────────────────
-Bug 1 – Wrong training-target direction
-  BAD : target = x_0 - x_lam          (data→noise, i.e. Flow Matching direction)
-  GOOD: target = (eps - x_0) * c(lam) (noise→data, the EqM direction)
-  Eq.(3) of the paper: L_EqM = (f(x_γ) − (ε − x)c(γ))²
+KEY DIVERGENCES FIXED
+─────────────────────────────────────────────────────────────────────────────
+Bug 1 – Non-Conservative Vector Field (Erratic Inference Dynamics)
+  The prior policy directly predicted a vector field f(x). Without a scalar 
+  energy constraint, the field is non-conservative, inducing limit cycles 
+  and unstable inference loops. We now compute a scalar energy E(x) and 
+  derive f(x) = ∇_x E(x) via autograd.
 
-Bug 2 – c(λ) used as a loss weight instead of being part of the target
-  BAD : loss = c_lam * MSE(pred, x_0 - x_lam)
-  GOOD: loss = MSE(pred, (eps - x_0) * c_lam)
-
-Bug 3 – Network received live timestep integers during inference
-  The paper states: "To remove conditioning on t from this backbone, we
-  set the input t to 0."  The network must see t=0 at inference so the
-  energy landscape is time-invariant (equilibrium).  During training γ
-  is used solely to build x_γ and the target magnitude; f never sees it.
-  BAD : forward_ebm(sample, lam_int, ...)   ← real timestep
-  GOOD: forward_ebm(sample, zeros, ...)     ← always t=0
-
-Bug 4 – OOD check used unseen timestep 0 or 1
-  With the fix above the OOD check naturally uses t=0, which is exactly
-  what the network was trained for (data manifold evaluation).
-
-The input/output contract of EqMPolicy (select_action / forward) is
-unchanged so the LeRobot evaluation harness works without modification.
+Bug 2 – Missing Autograd Graph Tracking during Loss Computation
+  When training an EBM via matching target vector fields, backpropagation must 
+  flow through the first derivative. We now use torch.autograd.grad with 
+  create_graph=True during compute_loss.
 """
 
 import math
@@ -166,60 +154,56 @@ class EquilibriumModel(nn.Module):
     # ── c(γ) schedule ────────────────────────────────────────────────────────
 
     def get_c_lambda(self, lam: Tensor) -> Tensor:
-        """
-        Magnitude schedule c(γ).  Must satisfy c(1) = 0 so that ground-truth
-        samples are energy-landscape stationary points (paper §3.1).
-        All variants below satisfy that constraint.
-        """
         if self.config.eqm_schedule_type == "linear":
-            return 1.0 - lam                                   # Eq.(4)
-
+            return 1.0 - lam
         elif self.config.eqm_schedule_type == "softmax":
-            # Smooth exponential decay, anchored at 0 for γ=1.
-            dev = lam.device
             return (torch.exp(-lam) - math.exp(-1.0)) / (1.0 - math.exp(-1.0))
-
         elif self.config.eqm_schedule_type == "piecewise":
-            # Truncated decay: flat at 1 for γ ≤ 0.5, then linear to 0.  Eq.(5)
             return torch.where(lam < 0.5, torch.ones_like(lam), 2.0 * (1.0 - lam))
-
         elif self.config.eqm_schedule_type == "grad_multiplier":
             return (1.0 - lam) ** 2
-
-        # Default: linear
         return 1.0 - lam
 
-    # ── Equilibrium gradient (inference only) ────────────────────────────────
+    # ── Conservative Gradient Field Routing via Autograd ─────────────────────
+
+    def get_gradient_field(self, x: Tensor, t: Tensor, global_cond: Tensor | None = None) -> Tensor:
+        """
+        Computes the conservative gradient field f(x) = ∇_x E(x) via autograd.
+        This forces the network output trajectory to remain stable.
+        """
+        # Ensure input leaf tracks gradient graph modifications
+        x_grad = x.detach().requires_grad_(True)
+        
+        # Scalar energy evaluation
+        energy = self.network.forward_energy(x_grad, t, global_cond=global_cond)
+        
+        # Compute gradient field vector w.r.t our input manifold position
+        grad = torch.autograd.grad(
+            outputs=energy,
+            inputs=x_grad,
+            grad_outputs=torch.ones_like(energy),
+            create_graph=self.training,  # Critical: True during training for weight updates
+            retain_graph=self.training,
+            only_inputs=True
+        )[0]
+        
+        return grad
 
     def forward_score(
         self,
         x_in: Tensor,
         global_cond: Tensor | None = None,
     ) -> Tensor:
-        """
-        Evaluate the learned equilibrium gradient field f(x) at inference.
-
-        The paper's key insight: at inference the network is time-invariant —
-        t is set to 0 for all queries (§3.4: "we set the input t to 0").
-        This makes the landscape a true equilibrium: no timestep schedule,
-        no annealing, just a fixed gradient field pointing toward the data
-        manifold.
-
-        Returns:
-            (B, horizon, action_dim) — predicted gradient ∇E(x) = f(x).
-        """
+        """Evaluate the learned equilibrium gradient field at inference step."""
         device = x_in.device
         B = x_in.shape[0]
-
-        # t = 0 for every sample — time-invariant equilibrium evaluation.
         t_zero = torch.zeros(B, dtype=torch.long, device=device)
 
-        # Direct network output; no extra autograd energy wrapping needed
-        # because at inference we use the implicit-gradient version (f(x) = ∇E).
-        with torch.no_grad():
-            score = self.network(x_in, t_zero, global_cond=global_cond)
+        # Force gradient mapping generation during outer evaluation harness no_grad locks
+        with torch.enable_grad():
+            score = self.get_gradient_field(x_in, t_zero, global_cond=global_cond)
 
-        return score  # (B, H, D)
+        return score.detach()
 
     # ── Reverse process: noise → action ──────────────────────────────────────
 
@@ -230,21 +214,9 @@ class EquilibriumModel(nn.Module):
         generator: torch.Generator | None = None,
         noise: Tensor | None = None,
     ) -> tuple[Tensor, Tensor]:
-        """
-        EqM sampling (Algorithm 2 from the paper):
-
-            x_{k+1} ← x_k − η · f(x_k)
-
-        f is evaluated at t=0 throughout (time-invariant landscape).
-
-        Returns:
-            sample : (B, horizon, action_dim)
-            is_ood : (B,) bool — True where gradient norm > ood_threshold
-        """
         device = get_device_from_parameters(self)
         dtype  = get_dtype_from_parameters(self)
 
-        # Initialise from noise
         sample = (
             noise if noise is not None
             else torch.randn(
@@ -259,41 +231,27 @@ class EquilibriumModel(nn.Module):
         N        = self.config.eqm_inference_steps
 
         for step in range(N):
-            # ── Evaluate equilibrium gradient at t=0 (time-invariant) ─────────
             grad = self.forward_score(sample, global_cond=global_cond)
 
-            # ── Sampler update (paper §3.3) ────────────────────────────────────
             if self.config.eqm_sampler_type == "gd":
-                # Vanilla gradient descent — Eq.(8)
                 sample = sample - lr * grad
-
             elif self.config.eqm_sampler_type == "nag_gd":
-                # Nesterov Accelerated Gradient — Eq.(9)
-                # Look-ahead gradient evaluated at x_k + μ·(x_k - x_{k-1})
-                # For simplicity we use the heavy-ball variant (common in practice)
                 velocity = momentum * velocity + grad
                 sample   = sample - lr * velocity
-
             elif self.config.eqm_sampler_type == "ode":
-                # Euler step on the probability-flow ODE
                 step_size = 1.0 / N
                 sample    = sample - step_size * grad
-
             elif self.config.eqm_sampler_type == "adaptive":
                 sample = sample - lr * grad
                 grad_norms = torch.norm(grad.reshape(batch_size, -1), dim=1)
                 if grad_norms.max() < self.config.ood_threshold:
-                    break  # Early termination: already near data manifold
+                    break
 
-        # ── Optional clipping ─────────────────────────────────────────────────
         if self.config.clip_sample:
             sample = torch.clamp(
                 sample, -self.config.clip_sample_range, self.config.clip_sample_range
             )
 
-        # ── OOD detection: evaluate gradient at t=0 on the final sample ───────
-        # Real data should satisfy f(x*) ≈ 0 (Statement 1 in the paper).
-        # Large residual gradient → sample is OOD.
         final_grad = self.forward_score(sample, global_cond=global_cond)
         grad_norms = torch.norm(final_grad.reshape(batch_size, -1), dim=1)
         is_ood     = grad_norms > self.config.ood_threshold
@@ -351,68 +309,30 @@ class EquilibriumModel(nn.Module):
     # ── Training loss ─────────────────────────────────────────────────────────
 
     def compute_loss(self, batch: dict[str, Tensor]) -> Tensor:
-        """
-        EqM training objective (Algorithm 1 / Eq.3 from the paper):
-
-            L_EqM = ( f(x_γ) − (ε − x) · c(γ) )²
-
-        Steps
-        ─────
-        1. Sample γ ∈ [0, 1] uniformly.
-        2. Build the noisy interpolant  x_γ = γ·x + (1−γ)·ε.
-        3. Compute the EqM target      T = (ε − x) · c(γ).
-           Direction: noise→data.  Magnitude: vanishes as γ→0 (near data).
-        4. Forward pass at t=0  (network is time-invariant per §3.4).
-        5. MSE loss.
-
-        Note on t=0
-        ───────────
-        The paper removes time conditioning by passing t=0 to the backbone.
-        Training uses t=0 as well so train/inference behaviour is identical —
-        the network never learns a timestep-dependent representation.
-        """
         global_cond = self._prepare_global_conditioning(batch)
 
-        x_0 = batch[ACTION]          # (B, horizon, action_dim)  — clean actions
+        x_0 = batch[ACTION]
         B   = x_0.shape[0]
         device = x_0.device
 
-        # ── Step 1: sample γ ∈ (0, 1] continuously ───────────────────────────
-        # Using a continuous uniform sample (not integers) matches the paper's
-        # description and gives smoother gradient coverage.
-        lam = torch.rand(B, device=device)          # (B,) ∈ [0, 1)
-        # Clamp away from 0 so the interpolant is always a proper mixture.
-        lam = lam.clamp(min=1e-4)
+        lam = torch.rand(B, device=device).clamp(min=1e-4)
 
-        # ── Step 2: build the noisy interpolant x_γ ──────────────────────────
-        # Paper §3.1:  x_γ = γ·x + (1−γ)·ε
-        # NOTE: paper's γ=1 means pure data, γ=0 means pure noise.
-        #       (Opposite convention to diffusion's t=0→data, t=1→noise.)
-        eps   = torch.randn_like(x_0)               # (B, H, D)
-        lam_  = lam.view(B, 1, 1)                   # broadcast-ready
-        x_lam = lam_ * x_0 + (1.0 - lam_) * eps    # (B, H, D)
+        eps   = torch.randn_like(x_0)
+        lam_  = lam.view(B, 1, 1)
+        x_lam = lam_ * x_0 + (1.0 - lam_) * eps
 
-        # ── Step 3: EqM target T = (ε − x) · c(γ) ───────────────────────────
-        # Direction (ε − x) points from data → noise in the *data* frame, but
-        # that is exactly the gradient that pushes x_γ *back toward data* when
-        # we do x ← x − η·f(x).  c(γ) weights it to zero at the data manifold.
-        c_lam  = self.get_c_lambda(lam).view(B, 1, 1)   # (B, 1, 1)
-        target = (eps - x_0) * c_lam                    # (B, H, D)
+        c_lam  = self.get_c_lambda(lam).view(B, 1, 1)
+        target = (eps - x_0) * c_lam
 
-        # ── Step 4: forward pass at t=0 (time-invariant) ─────────────────────
-        # t=0 for every sample — same as inference.  The step-embedding still
-        # exists in the UNet (for architectural compatibility) but receives a
-        # constant zero input, so it contributes a learned bias only.
+        # Generate predictions through our autograd wrapper
         t_zero = torch.zeros(B, dtype=torch.long, device=device)
-        pred   = self.network(x_lam, t_zero, global_cond=global_cond)  # (B, H, D)
+        pred   = self.get_gradient_field(x_lam, t_zero, global_cond=global_cond)
 
-        # ── Step 5: MSE loss ──────────────────────────────────────────────────
-        loss = F.mse_loss(pred, target, reduction="none")   # (B, H, D)
+        loss = F.mse_loss(pred, target, reduction="none")
 
-        # ── Step 6: optional padding mask ────────────────────────────────────
         if self.config.do_mask_loss_for_padding:
-            in_episode_bound = ~batch["action_is_pad"]       # (B, H)
-            mask     = in_episode_bound.unsqueeze(-1)         # (B, H, 1)
+            in_episode_bound = ~batch["action_is_pad"]
+            mask     = in_episode_bound.unsqueeze(-1)
             num_valid = mask.sum() * loss.shape[-1]
             return (loss * mask).sum() / num_valid.clamp_min(1)
 
@@ -420,7 +340,7 @@ class EquilibriumModel(nn.Module):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Vision encoder utilities  (structurally identical to prior version)
+#  Vision encoder utilities  (structurally identical)
 # ─────────────────────────────────────────────────────────────────────────────
 
 class SpatialSoftmax(nn.Module):
@@ -523,7 +443,7 @@ class DiffusionRgbEncoder(nn.Module):
         dummy_shape   = (1, images_shape[0], *dummy_shape_h_w)
         feature_map_shape = get_output_shape(self.backbone, dummy_shape)[1:]
 
-        self.pool        = SpatialSoftmax(feature_map_shape, num_kp=config.spatial_softmax_num_keypoints)
+        self.pool = SpatialSoftmax(feature_map_shape, num_kp=config.spatial_softmax_num_keypoints)
         self.feature_dim = config.spatial_softmax_num_keypoints * 2
         self.out  = nn.Linear(config.spatial_softmax_num_keypoints * 2, self.feature_dim)
         self.relu = nn.ReLU()
@@ -538,12 +458,10 @@ class DiffusionRgbEncoder(nn.Module):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  UNet backbone  (unchanged — only the *inputs* it receives change)
+#  UNet Backbone (Equipped with Energy Mapping Functions)
 # ─────────────────────────────────────────────────────────────────────────────
 
 class PositionalEmbed(nn.Module):
-    """Sinusoidal positional embedding (receives t=0 at both train and eval)."""
-
     def __init__(self, dim: int):
         super().__init__()
         self.dim = dim
@@ -611,7 +529,6 @@ class ConditionalUnet1d(nn.Module):
         super().__init__()
         self.config = config
 
-        # step_encoder still exists — it receives t=0 and learns a fixed bias.
         self.step_encoder = nn.Sequential(
             PositionalEmbed(config.diffusion_step_embed_dim),
             nn.Linear(config.diffusion_step_embed_dim, config.diffusion_step_embed_dim * 4),
@@ -624,9 +541,9 @@ class ConditionalUnet1d(nn.Module):
             zip(config.down_dims[:-1], config.down_dims[1:], strict=True)
         )
         common = {
-            "cond_dim":                cond_dim,
-            "kernel_size":             config.kernel_size,
-            "n_groups":                config.n_groups,
+            "cond_dim":                  cond_dim,
+            "kernel_size":               config.kernel_size,
+            "n_groups":                  config.n_groups,
             "use_film_scale_modulation": config.use_film_scale_modulation,
         }
 
@@ -658,11 +575,21 @@ class ConditionalUnet1d(nn.Module):
             nn.Conv1d(config.down_dims[0], config.action_feature.shape[0], 1),
         )
 
-    def forward(self, x: Tensor, lam_time: Tensor, global_cond=None) -> Tensor:
+        # Explicit Scalar Energy output configuration head
+        # Safe fallback check in case config class doesn't define the parameter explicitly yet
+        self.ebm_variant = getattr(config, "ebm_variant", "residual")
+        if self.ebm_variant == "scalar":
+            self.energy_head = nn.Sequential(
+                Conv1dBlock(config.down_dims[0], config.down_dims[0], kernel_size=config.kernel_size),
+                nn.AdaptiveAvgPool1d(1),
+                nn.Flatten(),
+                nn.Linear(config.down_dims[0], 1)
+            )
+
+    def forward_energy(self, x: Tensor, lam_time: Tensor, global_cond=None) -> Tensor:
+        """Computes the scalar Energy scalar E(x) across the action sequence batch."""
         x = einops.rearrange(x, "b t d -> b d t")
 
-        # lam_time is always 0 (from both compute_loss and forward_score).
-        # The step_encoder maps that to a learned constant bias vector.
         lam_embed      = self.step_encoder(lam_time)
         global_feature = (
             torch.cat([lam_embed, global_cond], axis=-1)
@@ -686,5 +613,36 @@ class ConditionalUnet1d(nn.Module):
             x = resnet2(x, global_feature)
             x = upsample(x)
 
+        if self.ebm_variant == "scalar":
+            # Variant A: Direct global pool scalar projection head
+            return self.energy_head(x)
+        else:
+            # Variant B: Square residual velocity norm definition: E(x) = 0.5 * ||UNet(x)||^2
+            x = self.final_conv(x)
+            x = einops.rearrange(x, "b d t -> b t d")
+            return 0.5 * torch.sum(x ** 2, dim=(1, 2), keepdim=True)
+
+    def forward(self, x: Tensor, lam_time: Tensor, global_cond=None) -> Tensor:
+        """Legacy placeholder for standard vector field inference backward-compatibility."""
+        x = einops.rearrange(x, "b t d -> b d t")
+        lam_embed      = self.step_encoder(lam_time)
+        global_feature = (
+            torch.cat([lam_embed, global_cond], axis=-1)
+            if global_cond is not None
+            else lam_embed
+        )
+        encoder_skip_features = []
+        for resnet, resnet2, downsample in self.down_modules:
+            x = resnet(x, global_feature)
+            x = resnet2(x, global_feature)
+            encoder_skip_features.append(x)
+            x = downsample(x)
+        for mid_module in self.mid_modules:
+            x = mid_module(x, global_feature)
+        for resnet, resnet2, upsample in self.up_modules:
+            x = torch.cat((x, encoder_skip_features.pop()), dim=1)
+            x = resnet(x, global_feature)
+            x = resnet2(x, global_feature)
+            x = upsample(x)
         x = self.final_conv(x)
         return einops.rearrange(x, "b d t -> b t d")
