@@ -2,21 +2,10 @@
 """
 Equilibrium Matching Policy for Robot Imitation Learning.
 
-Corrected to match the original EqM paper (arXiv 2510.02300) exactly by
-enforcing a conservative gradient field derived from a scalar energy function.
-
-KEY DIVERGENCES FIXED
-─────────────────────────────────────────────────────────────────────────────
-Bug 1 – Non-Conservative Vector Field (Erratic Inference Dynamics)
-  The prior policy directly predicted a vector field f(x). Without a scalar 
-  energy constraint, the field is non-conservative, inducing limit cycles 
-  and unstable inference loops. We now compute a scalar energy E(x) and 
-  derive f(x) = ∇_x E(x) via autograd.
-
-Bug 2 – Missing Autograd Graph Tracking during Loss Computation
-  When training an EBM via matching target vector fields, backpropagation must 
-  flow through the first derivative. We now use torch.autograd.grad with 
-  create_graph=True during compute_loss.
+Strictly adheres to the original EqM formulation (arXiv 2510.02300):
+1. Conservative vector field derived via scalar energy (E = dot(f, x) or -||f||^2/2).
+2. Purely time-invariant architecture (no t-embedding, no positional timestep graphs).
+3. Correct noise -> data velocity target scaled by the c(gamma) schedule.
 """
 
 import math
@@ -26,9 +15,10 @@ from collections.abc import Callable
 import einops
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 import torchvision
-from torch import Tensor, nn
+from torch import Tensor
 
 from .configuration_eqm import EqMConfig
 from lerobot.policies.pretrained import PreTrainedPolicy
@@ -42,7 +32,7 @@ from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Top-level policy wrapper  (public API — unchanged)
+#  Top-level policy wrapper
 # ─────────────────────────────────────────────────────────────────────────────
 
 class EqMPolicy(PreTrainedPolicy):
@@ -139,93 +129,78 @@ class EquilibriumModel(nn.Module):
         if self.config.env_state_feature:
             global_cond_dim += self.config.env_state_feature.shape[0]
 
+        cond_dim_total = global_cond_dim * config.n_obs_steps
+
         if self.config.model_type == "unet":
-            self.network = ConditionalUnet1d(
-                config, global_cond_dim=global_cond_dim * config.n_obs_steps
-            )
+            self.network = ConditionalUnet1d(config, global_cond_dim=cond_dim_total)
         elif self.config.model_type == "transformer":
-            raise NotImplementedError("Transformer architecture not yet integrated.")
+            self.network = EqMTransformer1d(config, global_cond_dim=cond_dim_total)
         elif self.config.model_type == "cnn":
             raise NotImplementedError("CNN architecture not yet integrated.")
+        else:
+            raise ValueError(f"Unknown model_type: {self.config.model_type}")
 
         if config.compile_model:
             self.network = torch.compile(self.network, mode=config.compile_mode)
 
-    # ── c(γ) schedule ────────────────────────────────────────────────────────
+        self.ebm = getattr(config, "ebm_variant", "dot")
 
+    # ── c(γ) schedule ────────────────────────────────────────────────────────
+    
     def get_c_lambda(self, lam: Tensor) -> Tensor:
-        if self.config.eqm_schedule_type == "linear":
+        # Graceful fallback to linear if eqm_schedule_type is not in config
+        schedule = getattr(self.config, "eqm_schedule_type", "linear")
+        if schedule == "linear":
             return 1.0 - lam
-        elif self.config.eqm_schedule_type == "softmax":
+        elif schedule == "softmax":
             return (torch.exp(-lam) - math.exp(-1.0)) / (1.0 - math.exp(-1.0))
-        elif self.config.eqm_schedule_type == "piecewise":
+        elif schedule == "piecewise":
             return torch.where(lam < 0.5, torch.ones_like(lam), 2.0 * (1.0 - lam))
-        elif self.config.eqm_schedule_type == "grad_multiplier":
+        elif schedule == "grad_multiplier":
             return (1.0 - lam) ** 2
         return 1.0 - lam
 
-    # ── Conservative Gradient Field Routing via Autograd ─────────────────────
+    # ── Conservative gradient field ───────────────────────────────────────────
 
-    def get_gradient_field(self, x: Tensor, t: Tensor, global_cond: Tensor | None = None) -> Tensor:
-        """
-        Computes the conservative gradient field f(x) = ∇_x E(x) via autograd.
-        This forces the network output trajectory to remain stable.
-        """
-        # Ensure input leaf tracks gradient graph modifications
-        x_grad = x.detach().requires_grad_(True)
-        
-        # Scalar energy evaluation
-        energy = self.network.forward_energy(x_grad, t, global_cond=global_cond)
-        
-        # Compute gradient field vector w.r.t our input manifold position
+    def _network_output(self, x: Tensor, global_cond: Tensor | None) -> Tensor:
+        """Raw, time-invariant network output f(x)."""
+        return self.network(x, global_cond=global_cond)
+
+    def _scalar_energy(self, x: Tensor, f: Tensor) -> Tensor:
+        if self.ebm == "dot":
+            return torch.sum(f * x, dim=(1, 2))
+        elif self.ebm == "l2":
+            return -0.5 * torch.sum(f * f, dim=(1, 2))
+        else:
+            raise ValueError(f"Unknown ebm variant: {self.ebm}")
+
+    def get_gradient_field(
+        self, x: Tensor, global_cond: Tensor | None = None
+    ) -> Tensor:
+        if self.ebm == "none":
+            return self._network_output(x, global_cond)
+
+        x_in = x.detach().requires_grad_(True)
+        f = self._network_output(x_in, global_cond)
+        E = self._scalar_energy(x_in, f)
         grad = torch.autograd.grad(
-            outputs=energy,
-            inputs=x_grad,
-            grad_outputs=torch.ones_like(energy),
-            create_graph=self.training,  # Critical: True during training for weight updates
+            outputs=E.sum(),
+            inputs=x_in,
+            create_graph=self.training,
             retain_graph=self.training,
-            only_inputs=True
+            only_inputs=True,
         )[0]
-        
         return grad
 
-    # def forward_score(
-    #     self,
-    #     x_in: Tensor,
-    #     global_cond: Tensor | None = None,
-    # ) -> Tensor:
-    #     """Evaluate the learned equilibrium gradient field at inference step."""
-    #     device = x_in.device
-    #     B = x_in.shape[0]
-    #     t_zero = torch.zeros(B, dtype=torch.long, device=device)
-
-    #     # Force gradient mapping generation during outer evaluation harness no_grad locks
-    #     with torch.enable_grad():
-    #         score = self.get_gradient_field(x_in, t_zero, global_cond=global_cond)
-
-    #     return score.detach()
     def forward_score(
-        self,
-        x_in: Tensor,
-        global_cond: Tensor | None = None,
+        self, x_in: Tensor, global_cond: Tensor | None = None
     ) -> Tensor:
-        """Evaluate the learned equilibrium gradient field at inference step."""
-        # 1. Temporarily suspend the outer inference_mode and turn on autograd graph tracking
         with torch.inference_mode(False), torch.enable_grad():
-            device = x_in.device
-            B = x_in.shape[0]
-
-            # 2. Convert incoming "Inference Tensors" to normal tensors by cloning them.
-            #    This creates a valid leaf node that the autograd engine can track.
-            x_in_normal = x_in.clone()
-            global_cond_normal = global_cond.clone() if global_cond is not None else None
-            t_zero = torch.zeros(B, dtype=torch.long, device=device)
-
-            # 3. Compute the conservative gradient field vector
-            score = self.get_gradient_field(x_in_normal, t_zero, global_cond=global_cond_normal)
-
-            # 4. Detach the result so it safely returns back to LeRobot's inference stream
+            x = x_in.clone()
+            gc = global_cond.clone() if global_cond is not None else None
+            score = self.get_gradient_field(x, global_cond=gc)
             return score.detach()
+
     # ── Reverse process: noise → action ──────────────────────────────────────
 
     def conditional_sample(
@@ -246,12 +221,13 @@ class EquilibriumModel(nn.Module):
             )
         )
 
-        lr       = self.config.eqm_lr
-        momentum = self.config.eqm_momentum
+        lr       = getattr(self.config, "eqm_lr", 1e-3)
+        momentum = getattr(self.config, "eqm_momentum", 0.9)
         velocity = torch.zeros_like(sample)
-        N        = self.config.eqm_inference_steps
+        N        = getattr(self.config, "eqm_inference_steps", 50)
+        ood_thr  = getattr(self.config, "ood_threshold", 10.0)
 
-        for step in range(N):
+        for _ in range(N):
             grad = self.forward_score(sample, global_cond=global_cond)
 
             if self.config.eqm_sampler_type == "gd":
@@ -265,17 +241,16 @@ class EquilibriumModel(nn.Module):
             elif self.config.eqm_sampler_type == "adaptive":
                 sample = sample - lr * grad
                 grad_norms = torch.norm(grad.reshape(batch_size, -1), dim=1)
-                if grad_norms.max() < self.config.ood_threshold:
+                if grad_norms.max() < ood_thr:
                     break
 
-        if self.config.clip_sample:
-            sample = torch.clamp(
-                sample, -self.config.clip_sample_range, self.config.clip_sample_range
-            )
+        clip_range = getattr(self.config, "clip_sample_range", None)
+        if getattr(self.config, "clip_sample", False) and clip_range is not None:
+            sample = torch.clamp(sample, -clip_range, clip_range)
 
         final_grad = self.forward_score(sample, global_cond=global_cond)
         grad_norms = torch.norm(final_grad.reshape(batch_size, -1), dim=1)
-        is_ood     = grad_norms > self.config.ood_threshold
+        is_ood     = grad_norms > ood_thr
 
         return sample, is_ood
 
@@ -332,28 +307,28 @@ class EquilibriumModel(nn.Module):
     def compute_loss(self, batch: dict[str, Tensor]) -> Tensor:
         global_cond = self._prepare_global_conditioning(batch)
 
-        x_0 = batch[ACTION]
-        B   = x_0.shape[0]
+        x_0    = batch[ACTION]          
+        B      = x_0.shape[0]
         device = x_0.device
 
         lam = torch.rand(B, device=device).clamp(min=1e-4)
+        lam_ = lam.view(B, 1, 1)
 
         eps   = torch.randn_like(x_0)
-        lam_  = lam.view(B, 1, 1)
-        x_lam = lam_ * x_0 + (1.0 - lam_) * eps
 
-        c_lam  = self.get_c_lambda(lam).view(B, 1, 1)
-        target = (eps - x_0) * c_lam
+        x_lam = (1.0 - lam_) * x_0 + lam_ * eps
 
-        # Generate predictions through our autograd wrapper
-        t_zero = torch.zeros(B, dtype=torch.long, device=device)
-        pred   = self.get_gradient_field(x_lam, t_zero, global_cond=global_cond)
+        # Correct Target: Velocity direction is Noise -> Data, scaled by c(gamma)
+        c_lam = self.get_c_lambda(lam).view(B, 1, 1)
+        target = (x_0 - eps) * c_lam                     
+
+        pred = self.get_gradient_field(x_lam, global_cond=global_cond)
 
         loss = F.mse_loss(pred, target, reduction="none")
 
-        if self.config.do_mask_loss_for_padding:
+        if getattr(self.config, "do_mask_loss_for_padding", False):
             in_episode_bound = ~batch["action_is_pad"]
-            mask     = in_episode_bound.unsqueeze(-1)
+            mask      = in_episode_bound.unsqueeze(-1)
             num_valid = mask.sum() * loss.shape[-1]
             return (loss * mask).sum() / num_valid.clamp_min(1)
 
@@ -361,7 +336,7 @@ class EquilibriumModel(nn.Module):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Vision encoder utilities  (structurally identical)
+#  Vision encoder utilities
 # ─────────────────────────────────────────────────────────────────────────────
 
 class SpatialSoftmax(nn.Module):
@@ -429,13 +404,13 @@ class DiffusionRgbEncoder(nn.Module):
         else:
             self.resize = None
 
-        crop_shape = config.crop_shape
+        crop_shape = getattr(config, "crop_shape", None)
         if crop_shape is not None:
             self.do_crop = True
             self.center_crop = torchvision.transforms.CenterCrop(crop_shape)
             self.maybe_random_crop = (
                 torchvision.transforms.RandomCrop(crop_shape)
-                if config.crop_is_random
+                if getattr(config, "crop_is_random", False)
                 else self.center_crop
             )
         else:
@@ -455,8 +430,8 @@ class DiffusionRgbEncoder(nn.Module):
             )
 
         images_shape = next(iter(config.image_features.values())).shape
-        if config.crop_shape is not None:
-            dummy_shape_h_w = config.crop_shape
+        if crop_shape is not None:
+            dummy_shape_h_w = crop_shape
         elif config.resize_shape is not None:
             dummy_shape_h_w = config.resize_shape
         else:
@@ -464,9 +439,10 @@ class DiffusionRgbEncoder(nn.Module):
         dummy_shape   = (1, images_shape[0], *dummy_shape_h_w)
         feature_map_shape = get_output_shape(self.backbone, dummy_shape)[1:]
 
-        self.pool = SpatialSoftmax(feature_map_shape, num_kp=config.spatial_softmax_num_keypoints)
-        self.feature_dim = config.spatial_softmax_num_keypoints * 2
-        self.out  = nn.Linear(config.spatial_softmax_num_keypoints * 2, self.feature_dim)
+        num_kp = getattr(config, "spatial_softmax_num_keypoints", 32)
+        self.pool = SpatialSoftmax(feature_map_shape, num_kp=num_kp)
+        self.feature_dim = num_kp * 2
+        self.out  = nn.Linear(num_kp * 2, self.feature_dim)
         self.relu = nn.ReLU()
 
     def forward(self, x: Tensor) -> Tensor:
@@ -479,22 +455,8 @@ class DiffusionRgbEncoder(nn.Module):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  UNet Backbone (Equipped with Energy Mapping Functions)
+#  UNet Backbone (Strictly Time-Invariant)
 # ─────────────────────────────────────────────────────────────────────────────
-
-class PositionalEmbed(nn.Module):
-    def __init__(self, dim: int):
-        super().__init__()
-        self.dim = dim
-
-    def forward(self, x: Tensor) -> Tensor:
-        device   = x.device
-        half_dim = self.dim // 2
-        emb = math.log(10000) / (half_dim - 1)
-        emb = torch.exp(torch.arange(half_dim, device=device) * -emb)
-        emb = x.unsqueeze(-1) * emb.unsqueeze(0)
-        return torch.cat((emb.sin(), emb.cos()), dim=-1)
-
 
 class Conv1dBlock(nn.Module):
     def __init__(self, inp_channels, out_channels, kernel_size, n_groups=8):
@@ -550,22 +512,17 @@ class ConditionalUnet1d(nn.Module):
         super().__init__()
         self.config = config
 
-        self.step_encoder = nn.Sequential(
-            PositionalEmbed(config.diffusion_step_embed_dim),
-            nn.Linear(config.diffusion_step_embed_dim, config.diffusion_step_embed_dim * 4),
-            nn.Mish(),
-            nn.Linear(config.diffusion_step_embed_dim * 4, config.diffusion_step_embed_dim),
-        )
-
-        cond_dim = config.diffusion_step_embed_dim + global_cond_dim
+        # Ensure cond_dim is > 0 for nn.Linear to initialize correctly
+        cond_dim = max(global_cond_dim, 1)
+        
         in_out   = [(config.action_feature.shape[0], config.down_dims[0])] + list(
             zip(config.down_dims[:-1], config.down_dims[1:], strict=True)
         )
         common = {
             "cond_dim":                  cond_dim,
-            "kernel_size":               config.kernel_size,
-            "n_groups":                  config.n_groups,
-            "use_film_scale_modulation": config.use_film_scale_modulation,
+            "kernel_size":               getattr(config, "kernel_size", 5),
+            "n_groups":                  getattr(config, "n_groups", 8),
+            "use_film_scale_modulation": getattr(config, "use_film_scale_modulation", True),
         }
 
         self.down_modules = nn.ModuleList([])
@@ -592,78 +549,162 @@ class ConditionalUnet1d(nn.Module):
             ]))
 
         self.final_conv = nn.Sequential(
-            Conv1dBlock(config.down_dims[0], config.down_dims[0], kernel_size=config.kernel_size),
+            Conv1dBlock(config.down_dims[0], config.down_dims[0], kernel_size=common["kernel_size"]),
             nn.Conv1d(config.down_dims[0], config.action_feature.shape[0], 1),
         )
 
-        # Explicit Scalar Energy output configuration head
-        # Safe fallback check in case config class doesn't define the parameter explicitly yet
-        self.ebm_variant = getattr(config, "ebm_variant", "residual")
-        if self.ebm_variant == "scalar":
-            self.energy_head = nn.Sequential(
-                Conv1dBlock(config.down_dims[0], config.down_dims[0], kernel_size=config.kernel_size),
-                nn.AdaptiveAvgPool1d(1),
-                nn.Flatten(),
-                nn.Linear(config.down_dims[0], 1)
-            )
-
-    def forward_energy(self, x: Tensor, lam_time: Tensor, global_cond=None) -> Tensor:
-        """Computes the scalar Energy scalar E(x) across the action sequence batch."""
+    def forward(self, x: Tensor, global_cond: Tensor | None = None) -> Tensor:
         x = einops.rearrange(x, "b t d -> b d t")
 
-        lam_embed      = self.step_encoder(lam_time)
-        global_feature = (
-            torch.cat([lam_embed, global_cond], axis=-1)
-            if global_cond is not None
-            else lam_embed
-        )
-
-        encoder_skip_features = []
-        for resnet, resnet2, downsample in self.down_modules:
-            x = resnet(x, global_feature)
-            x = resnet2(x, global_feature)
-            encoder_skip_features.append(x)
-            x = downsample(x)
-
-        for mid_module in self.mid_modules:
-            x = mid_module(x, global_feature)
-
-        for resnet, resnet2, upsample in self.up_modules:
-            x = torch.cat((x, encoder_skip_features.pop()), dim=1)
-            x = resnet(x, global_feature)
-            x = resnet2(x, global_feature)
-            x = upsample(x)
-
-        if self.ebm_variant == "scalar":
-            # Variant A: Direct global pool scalar projection head
-            return self.energy_head(x)
+        # Handle purely unconditional edge cases gracefully
+        if global_cond is None:
+            global_feature = torch.zeros(x.shape[0], 1, device=x.device)
         else:
-            # Variant B: Square residual velocity norm definition: E(x) = 0.5 * ||UNet(x)||^2
-            x = self.final_conv(x)
-            x = einops.rearrange(x, "b d t -> b t d")
-            return 0.5 * torch.sum(x ** 2, dim=(1, 2), keepdim=True)
+            global_feature = global_cond
 
-    def forward(self, x: Tensor, lam_time: Tensor, global_cond=None) -> Tensor:
-        """Legacy placeholder for standard vector field inference backward-compatibility."""
-        x = einops.rearrange(x, "b t d -> b d t")
-        lam_embed      = self.step_encoder(lam_time)
-        global_feature = (
-            torch.cat([lam_embed, global_cond], axis=-1)
-            if global_cond is not None
-            else lam_embed
-        )
-        encoder_skip_features = []
+        encoder_skip_features: list[Tensor] = []
         for resnet, resnet2, downsample in self.down_modules:
             x = resnet(x, global_feature)
             x = resnet2(x, global_feature)
             encoder_skip_features.append(x)
             x = downsample(x)
+
         for mid_module in self.mid_modules:
             x = mid_module(x, global_feature)
+
         for resnet, resnet2, upsample in self.up_modules:
             x = torch.cat((x, encoder_skip_features.pop()), dim=1)
             x = resnet(x, global_feature)
             x = resnet2(x, global_feature)
             x = upsample(x)
+
         x = self.final_conv(x)
         return einops.rearrange(x, "b d t -> b t d")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Transformer Backbone (Strictly Time-Invariant)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _get_1d_sincos_pos_embed(embed_dim: int, length: int) -> np.ndarray:
+    assert embed_dim % 2 == 0
+    omega = np.arange(embed_dim // 2, dtype=np.float64)
+    omega /= embed_dim / 2.0
+    omega  = 1.0 / (10000 ** omega)           
+    pos    = np.arange(length, dtype=np.float64)
+    out    = np.outer(pos, omega)              
+    emb    = np.concatenate([np.sin(out), np.cos(out)], axis=1)  
+    return emb.astype(np.float32)
+
+
+def _modulate(x: Tensor, shift: Tensor, scale: Tensor) -> Tensor:
+    return x * (1.0 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+
+
+class EqMTransformerBlock(nn.Module):
+    def __init__(self, hidden_size: int, num_heads: int, mlp_ratio: float = 4.0):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.attn  = nn.MultiheadAttention(hidden_size, num_heads, batch_first=True)
+        self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        mlp_hidden = int(hidden_size * mlp_ratio)
+        self.mlp = nn.Sequential(
+            nn.Linear(hidden_size, mlp_hidden),
+            nn.GELU(approximate="tanh"),
+            nn.Linear(mlp_hidden, hidden_size),
+        )
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(hidden_size, 6 * hidden_size, bias=True),
+        )
+        nn.init.constant_(self.adaLN_modulation[-1].weight, 0)
+        nn.init.constant_(self.adaLN_modulation[-1].bias, 0)
+
+    def forward(self, x: Tensor, c: Tensor) -> Tensor:
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
+            self.adaLN_modulation(c).chunk(6, dim=1)
+        )
+        x_norm = _modulate(self.norm1(x), shift_msa, scale_msa)
+        attn_out, _ = self.attn(x_norm, x_norm, x_norm)
+        x = x + gate_msa.unsqueeze(1) * attn_out
+        
+        x = x + gate_mlp.unsqueeze(1) * self.mlp(_modulate(self.norm2(x), shift_mlp, scale_mlp))
+        return x
+
+
+class EqMTransformerFinalLayer(nn.Module):
+    def __init__(self, hidden_size: int, action_dim: int):
+        super().__init__()
+        self.norm_final = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.linear = nn.Linear(hidden_size, action_dim, bias=True)
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(hidden_size, 2 * hidden_size, bias=True),
+        )
+        nn.init.constant_(self.adaLN_modulation[-1].weight, 0)
+        nn.init.constant_(self.adaLN_modulation[-1].bias, 0)
+        nn.init.constant_(self.linear.weight, 0)
+        nn.init.constant_(self.linear.bias, 0)
+
+    def forward(self, x: Tensor, c: Tensor) -> Tensor:
+        shift, scale = self.adaLN_modulation(c).chunk(2, dim=1)
+        x = _modulate(self.norm_final(x), shift, scale)
+        return self.linear(x)
+
+
+class EqMTransformer1d(nn.Module):
+    def __init__(self, config: EqMConfig, global_cond_dim: int):
+        super().__init__()
+        self.config = config
+        action_dim  = config.action_feature.shape[0]
+        seq_len     = config.horizon
+
+        hidden_size = getattr(config, "transformer_hidden_size", 512)
+        depth       = getattr(config, "transformer_depth",       6)
+        num_heads   = getattr(config, "transformer_num_heads",   8)
+        mlp_ratio   = getattr(config, "transformer_mlp_ratio",   4.0)
+
+        self.token_embed = nn.Linear(action_dim, hidden_size, bias=True)
+
+        pos_emb = _get_1d_sincos_pos_embed(hidden_size, seq_len)      
+        self.register_buffer(
+            "pos_embed", torch.from_numpy(pos_emb).unsqueeze(0)       
+        )
+
+        # Global conditioning projection (acts as sole modulation source)
+        cond_dim = max(global_cond_dim, 1)
+        self.cond_proj = nn.Linear(cond_dim, hidden_size, bias=True)
+
+        self.blocks = nn.ModuleList([
+            EqMTransformerBlock(hidden_size, num_heads, mlp_ratio)
+            for _ in range(depth)
+        ])
+
+        self.final_layer = EqMTransformerFinalLayer(hidden_size, action_dim)
+
+        self._initialize_weights()
+
+    def _initialize_weights(self):
+        def _basic_init(m):
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+
+        self.apply(_basic_init)
+
+    def forward(
+        self, x: Tensor, global_cond: Tensor | None = None
+    ) -> Tensor:
+        x = self.token_embed(x) + self.pos_embed   
+        
+        if global_cond is not None:
+            c = self.cond_proj(global_cond) 
+        else:
+            c = torch.zeros(x.shape[0], self.cond_proj.out_features, device=x.device) 
+
+        for block in self.blocks:
+            x = block(x, c)                         
+
+        x = self.final_layer(x, c)                  
+        return x
